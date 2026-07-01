@@ -1,0 +1,868 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeerFlow, rebuilt in the open</title>
+<style>
+:root { --ink:#0f172a; --muted:#475569; --line:#e2e8f0; --accent:#4f46e5;
+        --bg:#ffffff; --code-bg:#0f172a; --code-ink:#e2e8f0; }
+* { box-sizing:border-box; }
+body { margin:0; background:#f8fafc; color:var(--ink);
+  font:17px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,Arial,sans-serif; }
+.wrap { max-width:840px; margin:0 auto; padding:56px 24px 96px; background:var(--bg); }
+h1 { font-size:2.15rem; line-height:1.2; letter-spacing:-.02em; margin:.2em 0 .1em; }
+h3 { color:var(--muted); font-weight:600; margin-top:0; }
+h2 { font-size:1.55rem; margin:2.2em 0 .6em; padding-top:1.2em; border-top:1px solid var(--line);
+     letter-spacing:-.01em; }
+h4 { font-size:1.15rem; margin:1.8em 0 .4em; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+blockquote { margin:1.4em 0; padding:.6em 1.1em; border-left:4px solid var(--accent);
+  background:#eef2ff; color:#334155; border-radius:0 8px 8px 0; font-size:.96em; }
+figure { margin:1.8em 0; text-align:center; }
+figure svg { max-width:100%; height:auto; border:1px solid var(--line); border-radius:12px;
+  background:#fff; box-shadow:0 1px 6px rgba(15,23,42,.06); }
+figcaption { color:var(--muted); font-size:.85em; margin-top:.5em; }
+table { border-collapse:collapse; width:100%; margin:1.4em 0; font-size:.94em; }
+th,td { border:1px solid var(--line); padding:9px 12px; text-align:left; vertical-align:top; }
+th { background:#f1f5f9; }
+tr:nth-child(even) td { background:#fafbfc; }
+code { font-family:'JetBrains Mono',SFMono-Regular,Consolas,monospace; font-size:.86em;
+  background:#eef2ff; color:#3730a3; padding:.12em .38em; border-radius:5px; }
+pre { background:var(--code-bg); color:var(--code-ink); padding:18px 20px; border-radius:12px;
+  overflow-x:auto; font-size:.86em; line-height:1.55; }
+pre code { background:none; color:inherit; padding:0; }
+hr { border:none; border-top:1px solid var(--line); margin:2.4em 0; }
+em { color:var(--muted); }
+.wrap > p:last-child em { font-size:.88em; }
+</style></head>
+<body><div class="wrap">
+<h1>DeerFlow, rebuilt in the open</h1>
+<h3>How a LangGraph "SuperAgent" actually works — and how to run one with zero cloud keys</h3>
+<blockquote>
+<p>This article is part of a series that takes a trending AI repository (spotted by
+<a href="https://github.com/batlabx/gittyboy">Gittyboy</a>) and does two things: explains the design <em>only through
+pictures and code</em>, then rebuilds it as a fully open-source stack. This one is about
+<strong><a href="https://github.com/bytedance/deer-flow">bytedance/deer-flow</a></strong> — an open-source, long-horizon agent
+harness that researches, codes, and writes. The working rewrite lives in <a href="src/open_deerflow"><code>src/</code></a>; every diagram is reproducible from <a href="diagrams"><code>diagrams/</code></a>.</p>
+</blockquote>
+<hr />
+<h2>1. The problem it solves</h2>
+<p>Most AI agents are sprinters. You give them a prompt, they think for a few seconds, they hand back an answer. That works beautifully for "summarise this email" and falls apart the moment the task is <em>long</em>: research the market for a category, read forty sources, run a benchmark, cross-check the numbers, and write a cited report. Those tasks take <strong>minutes to hours</strong>, not seconds, and they break single-shot agents in four specific ways:</p>
+<ul>
+<li><strong>Context runs out.</strong> Forty sources do not fit in one window. Something has to gather, compress, and discard as it goes.</li>
+<li><strong>The work is parallel.</strong> Ten independent research threads should not run one-after-another at the speed of the slowest.</li>
+<li><strong>Code has to run — safely.</strong> "Benchmark each option" means executing untrusted, model-written code without letting it touch your machine.</li>
+<li><strong>Interruptions are fatal.</strong> If a two-hour run dies at minute 90, you cannot afford to start over.</li>
+</ul>
+<p>DeerFlow (ByteDance's "Deep Exploration and Efficient Research flow") is a production-grade answer to all four. It is a <strong>LangGraph state machine</strong> that decomposes a task into a plan, spawns specialised sub-agents, runs their code in sandboxes, checkpoints its state after every step, and streams the result to a web UI or a Python client. It is one of the most-starred open agent frameworks of the year precisely because it is the <em>complete</em> pattern, not a toy.</p>
+<h3>Practical use cases</h3>
+<table>
+<thead>
+<tr>
+<th>You want to…</th>
+<th>DeerFlow does this by…</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Produce a cited deep-research report</strong> ("compare the top 5 OSS inference engines")</td>
+<td>fanning out parallel <code>researcher</code> sub-agents, each searching + reading sources, then a <code>reporter</code> synthesises with citations</td>
+</tr>
+<tr>
+<td><strong>Run an analysis that needs real computation</strong> ("benchmark each option and chart it")</td>
+<td>handing structured data to a <code>coder</code> sub-agent that writes and executes Python in a sandbox</td>
+</tr>
+<tr>
+<td><strong>Do competitive / market intelligence</strong></td>
+<td>querying many sources (web, docs, APIs via MCP) and returning a structured brief</td>
+</tr>
+<tr>
+<td><strong>Drive a content pipeline</strong> (research → outline → draft → assets)</td>
+<td>chaining nodes so each stage's output becomes the next stage's input</td>
+</tr>
+<tr>
+<td><strong>Automate a recurring analyst task on a schedule</strong></td>
+<td>resuming from a checkpoint, so long jobs survive restarts and can run unattended</td>
+</tr>
+</tbody>
+</table>
+<p>The through-line: <strong>any task that is too long or too multi-step for one prompt, but still needs to end in a single, trustworthy deliverable.</strong></p>
+<hr />
+<h2>2. How it works, in pictures</h2>
+<p>The best one-sentence description of DeerFlow is a control-flow graph: a <strong>Coordinator</strong> decides if the task is real research; a <strong>Planner</strong> breaks it into steps; a <strong>human approves the plan</strong>; a <strong>Research Team</strong> supervisor dispatches each step to a <strong>Researcher</strong> or a <strong>Coder</strong>; and a <strong>Reporter</strong> writes the final answer. Everything else — search, crawling, code execution, memory — hangs off those nodes as tools and infrastructure.</p>
+<h3>Architecture</h3>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 910" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"><rect width="1180" height="910" fill="#ffffff"/><defs><marker id="ar--475569" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker><marker id="ar--94a3b8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker><marker id="ar--0d9488" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0d9488"/></marker><marker id="ar--7c3aed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/></marker><filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter></defs><rect x="40" y="96" width="250" height="250" rx="16" ry="16" fill="none" stroke="#475569" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="56" y="83" width="62.4" height="24" rx="12" fill="#475569"/>
+<text x="87.2" y="99" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">Clients</text>
+<rect x="55" y="120" width="220" height="56" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="120" width="6" height="56" rx="3" fill="#334155"/>
+<text x="165.0" y="146" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Web UI (Next.js)</text>
+<text x="165.0" y="166" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">chat · plan review · replay</text>
+<rect x="55" y="188" width="220" height="50" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="188" width="6" height="50" rx="3" fill="#334155"/>
+<text x="165.0" y="214" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Python SDK</text>
+<text x="165.0" y="234" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">client.run(task)</text>
+<rect x="55" y="252" width="220" height="74" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="252" width="6" height="74" rx="3" fill="#334155"/>
+<text x="165.0" y="278" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Message Gateway</text>
+<text x="165.0" y="298" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">REST + SSE streaming, auth</text>
+<rect x="315" y="96" width="470" height="560" rx="16" ry="16" fill="none" stroke="#4f46e5" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="331" y="83" width="264.0" height="24" rx="12" fill="#4f46e5"/>
+<text x="463.0" y="99" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">LangGraph Orchestrator (StateGraph)</text>
+<rect x="345" y="122" width="410" height="50" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="122" width="6" height="50" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="148" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coordinator</text>
+<text x="550.0" y="168" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">intent routing · entry</text>
+<rect x="345" y="186" width="410" height="50" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="186" width="6" height="50" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="212" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Planner</text>
+<text x="550.0" y="232" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">decompose into a research plan</text>
+<rect x="345" y="250" width="410" height="46" rx="12" ry="12" fill="#ecfdf5" stroke="#059669" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="250" width="6" height="46" rx="3" fill="#059669"/>
+<text x="550.0" y="276" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Human Feedback</text>
+<text x="550.0" y="296" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">accept / edit plan (interrupt)</text>
+<rect x="345" y="316" width="410" height="44" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="316" width="6" height="44" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="342" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Research Team</text>
+<text x="550.0" y="362" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">supervisor · loops over steps</text>
+<rect x="345" y="378" width="195" height="64" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="378" width="6" height="64" rx="3" fill="#4f46e5"/>
+<text x="442.5" y="404" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Researcher</text>
+<text x="442.5" y="424" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">gather + cite evidence</text>
+<rect x="560" y="378" width="195" height="64" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="560" y="378" width="6" height="64" rx="3" fill="#4f46e5"/>
+<text x="657.5" y="404" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coder</text>
+<text x="657.5" y="424" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">analyse · run Python</text>
+<rect x="345" y="470" width="410" height="52" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="470" width="6" height="52" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="496" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reporter</text>
+<text x="550.0" y="516" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">synthesise final cited report</text>
+<rect x="800" y="96" width="340" height="448" rx="16" ry="16" fill="none" stroke="#0d9488" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="816" y="83" width="235.20000000000002" height="24" rx="12" fill="#0d9488"/>
+<text x="933.6" y="99" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">Tools &amp; Skills (built-in + MCP)</text>
+<rect x="815" y="122" width="310" height="52" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="122" width="6" height="52" rx="3" fill="#0d9488"/>
+<text x="970.0" y="148" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Web Search</text>
+<text x="970.0" y="168" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Tavily · Brave · DuckDuckGo · Arxiv</text>
+<rect x="815" y="184" width="310" height="48" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="184" width="6" height="48" rx="3" fill="#0d9488"/>
+<text x="970.0" y="210" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Crawler</text>
+<text x="970.0" y="230" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Jina / readability extract</text>
+<rect x="815" y="242" width="310" height="52" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="242" width="6" height="52" rx="3" fill="#0d9488"/>
+<text x="970.0" y="268" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Python REPL</text>
+<text x="970.0" y="288" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">executes inside the sandbox</text>
+<rect x="815" y="304" width="310" height="48" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="304" width="6" height="48" rx="3" fill="#0d9488"/>
+<text x="970.0" y="330" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">RAG Retriever</text>
+<text x="970.0" y="350" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">private docs · vector store</text>
+<rect x="815" y="362" width="310" height="50" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="362" width="6" height="50" rx="3" fill="#0d9488"/>
+<text x="970.0" y="388" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">MCP Servers</text>
+<text x="970.0" y="408" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">pluggable external tools</text>
+<rect x="815" y="422" width="310" height="60" rx="12" ry="12" fill="#fffbeb" stroke="#d97706" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="422" width="6" height="60" rx="3" fill="#d97706"/>
+<text x="970.0" y="448" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Skills</text>
+<text x="970.0" y="468" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">reusable prompt+tool playbooks</text>
+<rect x="40" y="690" width="730" height="150" rx="16" ry="16" fill="none" stroke="#475569" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="56" y="677" width="120.0" height="24" rx="12" fill="#475569"/>
+<text x="116.0" y="693" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">Runtime &amp; State</text>
+<rect x="55" y="720" width="225" height="62" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="720" width="6" height="62" rx="3" fill="#334155"/>
+<text x="167.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Docker / K8s Sandbox</text>
+<text x="167.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">managed provisioner</text>
+<rect x="295" y="720" width="215" height="62" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="295" y="720" width="6" height="62" rx="3" fill="#334155"/>
+<text x="402.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Checkpointer</text>
+<text x="402.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Postgres · resume state</text>
+<rect x="525" y="720" width="230" height="62" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="525" y="720" width="6" height="62" rx="3" fill="#334155"/>
+<text x="640.0" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Filesystem + Memory</text>
+<text x="640.0" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">artifacts · long-term memory</text>
+<rect x="800" y="690" width="340" height="150" rx="16" ry="16" fill="none" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="816" y="677" width="105.60000000000001" height="24" rx="12" fill="#7c3aed"/>
+<text x="868.8" y="693" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">LLM Providers</text>
+<rect x="815" y="720" width="155" height="62" rx="12" ry="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="720" width="6" height="62" rx="3" fill="#7c3aed"/>
+<text x="892.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reasoning LLM</text>
+<text x="892.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">cloud / any provider</text>
+<rect x="980" y="720" width="145" height="62" rx="12" ry="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#sh)"/>
+<rect x="980" y="720" width="6" height="62" rx="3" fill="#7c3aed"/>
+<text x="1052.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Basic · Vision</text>
+<text x="1052.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">cloud / any provider</text>
+<path d="M 280 285 Q 311.5 205.5 343 150" fill="none" stroke="#475569" stroke-width="2.2"  marker-end="url(#ar--475569)"/>
+<rect x="293.7" y="198.5" width="35.6" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="311.5" y="211.5" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">task</text>
+<path d="M 550 172 L 550 186" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 550 236 L 550 250" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 550 296 L 550 316" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 470 360 L 442 378" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 630 360 L 658 378" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 550 442 L 550 470" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 757 338 Q 785.0 305.0 813 300" fill="none" stroke="#0d9488" stroke-width="2.2"  marker-end="url(#ar--0d9488)"/>
+<rect x="693.6" y="300.0" width="182.8" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="785.0" y="313.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">search · crawl · exec · RAG</text>
+<path d="M 343 496 Q 310.5 424.0 278 300" fill="none" stroke="#475569" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ar--475569)"/>
+<rect x="263.9" y="379.0" width="93.2" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="310.5" y="392.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">stream result</text>
+<path d="M 430 656 Q 380.0 683.0 330 690" fill="none" stroke="#475569" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ar--475569)"/>
+<rect x="323.8" y="654.0" width="112.4" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="380.0" y="667.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">checkpoint state</text>
+<path d="M 670 656 Q 785.0 691.0 900 690" fill="none" stroke="#7c3aed" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ar--7c3aed)"/>
+<rect x="728.8" y="654.0" width="112.4" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="785.0" y="667.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">every node → LLM</text>
+<g>
+<rect x="60" y="881" width="16" height="16" rx="4" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+<text x="84" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Agent</text>
+<rect x="232" y="881" width="16" height="16" rx="4" fill="#ecfeff" stroke="#0d9488" stroke-width="2"/>
+<text x="256" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Tool</text>
+<rect x="404" y="881" width="16" height="16" rx="4" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+<text x="428" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Skill</text>
+<rect x="576" y="881" width="16" height="16" rx="4" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+<text x="600" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Model</text>
+<rect x="748" y="881" width="16" height="16" rx="4" fill="#f1f5f9" stroke="#334155" stroke-width="2"/>
+<text x="772" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Infra</text>
+<rect x="920" y="881" width="16" height="16" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+<text x="944" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Human gate</text>
+</g>
+<text x="590.0" y="34" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="800" fill="#0f172a" text-anchor="middle" style="">DeerFlow — Architecture (as shipped)</text>
+<text x="590.0" y="58" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="normal" fill="#475569" text-anchor="middle" style="">LangGraph SuperAgent: Coordinator → Planner → Research Team → Reporter</text></svg><figcaption>DeerFlow architecture</figcaption></figure></p>
+<p>Three things are worth reading off that diagram:</p>
+<ol>
+<li><strong>The orchestrator is a LangGraph <code>StateGraph</code>.</strong> Nodes are the boxes in the middle. They don't call each other directly; each node returns a <code>Command</code> that says "update the state like <em>this</em>, then go to <em>that</em> node." That is what makes the topology dynamic — the graph reshapes itself at runtime based on the plan.</li>
+<li><strong>Tools are separate from agents.</strong> Web search, crawling, the Python REPL, RAG, and any pluggable <strong>MCP</strong> server live in their own column. Agents <em>call</em> them; they don't contain them.</li>
+<li><strong>State and runtime are cross-cutting.</strong> Every node talks to the LLM tier and writes to the checkpointer, so a run can pause (for the human) or crash (and resume) without losing progress.</li>
+</ol>
+<h3>The agents, tools, and skills</h3>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Name</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🟦 Agent</td>
+<td><strong>Coordinator</strong></td>
+<td>Classify the task; reject non-research requests cheaply</td>
+</tr>
+<tr>
+<td>🟦 Agent</td>
+<td><strong>Planner</strong></td>
+<td>Decompose the task into typed, ordered steps</td>
+</tr>
+<tr>
+<td>🟩 Human gate</td>
+<td><strong>Human Feedback</strong></td>
+<td>Accept or edit the plan before any tool runs (a LangGraph <em>interrupt</em>)</td>
+</tr>
+<tr>
+<td>🟦 Agent</td>
+<td><strong>Research Team</strong></td>
+<td>Supervisor loop: dispatch the next step, or finish</td>
+</tr>
+<tr>
+<td>🟦 Agent</td>
+<td><strong>Researcher</strong></td>
+<td>Gather + cite evidence using search/crawl/RAG</td>
+</tr>
+<tr>
+<td>🟦 Agent</td>
+<td><strong>Coder</strong></td>
+<td>Analyse data / run Python in the sandbox</td>
+</tr>
+<tr>
+<td>🟦 Agent</td>
+<td><strong>Reporter</strong></td>
+<td>Synthesise the final, cited report</td>
+</tr>
+<tr>
+<td>🟩 Tool</td>
+<td><strong>Web Search / Crawler / Python REPL / RAG / MCP</strong></td>
+<td>Effectful capabilities the agents invoke</td>
+</tr>
+<tr>
+<td>🟧 Skill</td>
+<td><strong>Playbooks</strong></td>
+<td>Reusable prompt+tool recipes (how to plan, how to report)</td>
+</tr>
+</tbody>
+</table>
+<h3>Sequence of a single run</h3>
+<p>Static boxes don't show the <em>loop</em>. This does:</p>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 920" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"><rect width="1280" height="920" fill="#ffffff"/><defs><marker id="ar--475569" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker><marker id="ar--94a3b8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker><marker id="ar--0d9488" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0d9488"/></marker><marker id="ar--7c3aed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/></marker><filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter></defs><rect x="29.0" y="70" width="122" height="42" rx="11" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="29.0" y="70" width="6" height="42" rx="3" fill="#334155"/>
+<text x="90.0" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">User</text>
+<line x1="90.0" y1="114" x2="90.0" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="186.14285714285714" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="186.14285714285714" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="247.14285714285714" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coordinator</text>
+<line x1="247.14285714285714" y1="114" x2="247.14285714285714" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="343.2857142857143" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="343.2857142857143" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="404.2857142857143" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Planner</text>
+<line x1="404.2857142857143" y1="114" x2="404.2857142857143" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="500.42857142857144" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="500.42857142857144" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="561.4285714285714" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Researcher</text>
+<line x1="561.4285714285714" y1="114" x2="561.4285714285714" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="645.5714285714286" y="70" width="146" height="42" rx="11" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="645.5714285714286" y="70" width="6" height="42" rx="3" fill="#0d9488"/>
+<text x="718.5714285714286" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Tavily / Search</text>
+<line x1="718.5714285714286" y1="114" x2="718.5714285714286" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="814.7142857142857" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="814.7142857142857" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="875.7142857142857" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coder</text>
+<line x1="875.7142857142857" y1="114" x2="875.7142857142857" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="971.8571428571429" y="70" width="122" height="42" rx="11" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="971.8571428571429" y="70" width="6" height="42" rx="3" fill="#334155"/>
+<text x="1032.857142857143" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">K8s Sandbox</text>
+<line x1="1032.857142857143" y1="114" x2="1032.857142857143" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="1129.0" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="1129.0" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="1190.0" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reporter</text>
+<line x1="1190.0" y1="114" x2="1190.0" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<line x1="90.0" y1="142" x2="247.14285714285714" y2="142" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="112.97142857142856" y="123" width="111.2" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="168.57142857142856" y="136" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">research request</text>
+<line x1="247.14285714285714" y1="192" x2="404.2857142857143" y2="192" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="217.4142857142857" y="173" width="216.6" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="325.7142857142857" y="186" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">classified as research → hand off</text>
+<line x1="404.2857142857143" y1="242" x2="90.0" y2="242" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="179.14285714285714" y="223" width="136.0" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="247.14285714285714" y="236" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">propose plan (steps)</text>
+<line x1="90.0" y1="292" x2="404.2857142857143" y2="292" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="185.34285714285713" y="273" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="247.14285714285714" y="286" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">accept / edit plan</text>
+<line x1="60" y1="328" x2="1220" y2="328" stroke="#cbd5e1" stroke-width="1.2" stroke-dasharray="2 6"/>
+<rect x="542.9" y="318" width="194.2" height="20" rx="10" fill="#e2e8f0"/>
+<text x="640.0" y="332" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="700" fill="#475569" text-anchor="middle" style="">loop  ·  for each plan step</text>
+<line x1="404.2857142857143" y1="392" x2="561.4285714285714" y2="392" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="411.75714285714287" y="373" width="142.20000000000002" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="482.8571428571429" y="386" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">execute research step</text>
+<line x1="561.4285714285714" y1="442" x2="718.5714285714286" y2="442" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="578.2" y="423" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="640.0" y="436" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">web_search / crawl</text>
+<line x1="718.5714285714286" y1="492" x2="561.4285714285714" y2="492" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="578.2" y="473" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="640.0" y="486" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">sources + snippets</text>
+<line x1="561.4285714285714" y1="542" x2="875.7142857142857" y2="542" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="616.4714285714285" y="523" width="204.20000000000002" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="718.5714285714286" y="536" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">hand structured data to analyst</text>
+<line x1="875.7142857142857" y1="592" x2="1032.857142857143" y2="592" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="870.7857142857142" y="573" width="167.0" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="954.2857142857142" y="586" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">run python (charts, calc)</text>
+<line x1="1032.857142857143" y1="642" x2="875.7142857142857" y2="642" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="892.4857142857143" y="623" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="954.2857142857142" y="636" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">stdout / artifacts</text>
+<rect x="233.14285714285714" y="672" width="970.8571428571429" height="30" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+<text x="718.5714285714286" y="691" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">every node calls the cloud LLM; state saved to checkpointer after each step</text>
+<line x1="60" y1="728" x2="1220" y2="728" stroke="#cbd5e1" stroke-width="1.2" stroke-dasharray="2 6"/>
+<rect x="605.6" y="718" width="68.8" height="20" rx="10" fill="#e2e8f0"/>
+<text x="640.0" y="732" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="700" fill="#475569" text-anchor="middle" style="">end loop</text>
+<line x1="875.7142857142857" y1="792" x2="1190.0" y2="792" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="967.9571428571429" y="773" width="129.8" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="1032.857142857143" y="786" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">findings + evidence</text>
+<line x1="1190.0" y1="842" x2="90.0" y2="842" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="544.1" y="823" width="191.8" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="640.0" y="836" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">final cited report (streamed)</text>
+<text x="640.0" y="34" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="800" fill="#0f172a" text-anchor="middle" style="">DeerFlow — Sequence of one research task</text>
+<text x="640.0" y="58" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="normal" fill="#475569" text-anchor="middle" style="">Human-in-the-loop plan, then a research/analysis loop, then synthesis</text></svg><figcaption>DeerFlow sequence</figcaption></figure></p>
+<p>Note the shape: a <strong>human-in-the-loop plan gate</strong> up front, then a <strong>research/analysis loop</strong> that repeats per plan step (search → read → hand to analyst → run code), and finally a <strong>single synthesis</strong> into the report. The orange bar is the invariant that makes long runs survivable: <em>every node calls the model and every step is checkpointed.</em></p>
+<hr />
+<h2>3. How to build an open-source version</h2>
+<p>Here is the punchline that surprises people: <strong>DeerFlow is already ~80% open-source.</strong> LangGraph, LangChain, MCP, and the Postgres checkpointer are all open. What actually ties a deployment to the cloud is a short list — the <strong>LLM behind a provider key</strong> and the <strong>hosted search API</strong> — plus a couple of managed conveniences (a Kubernetes sandbox provisioner, a hosted web reader).</p>
+<p>So "build an open-source version" is really "swap the four closed dependencies and keep the architecture." Here's the map:</p>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1220 722" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"><rect width="1220" height="722" fill="#ffffff"/><defs><marker id="ar--475569" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker><marker id="ar--94a3b8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker><marker id="ar--0d9488" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0d9488"/></marker><marker id="ar--7c3aed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/></marker><filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter></defs><text x="460.0" y="132" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="800" fill="#4f46e5" text-anchor="middle" style="">DeerFlow (as shipped)</text>
+<text x="865.0" y="132" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="800" fill="#059669" text-anchor="middle" style="">Open-source equivalent</text>
+<text x="150" y="132" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="800" fill="#475569" text-anchor="middle" style="">Concern</text>
+<text x="150" y="183.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Orchestration</text>
+<rect x="285" y="158" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="158" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="184" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">LangGraph StateGraph</text>
+<rect x="690" y="158" width="350" height="42" rx="12" ry="12" fill="#ecfdf5" stroke="#059669" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="158" width="6" height="42" rx="3" fill="#059669"/>
+<text x="865.0" y="184" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">LangGraph StateGraph</text>
+<path d="M 641 179.0 L 684 179.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="166.0" width="52" height="26" rx="13" fill="#059669"/>
+<text x="1080.0" y="183.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">keep</text>
+<text x="150" y="241.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reasoning model</text>
+<rect x="285" y="216" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="216" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="242" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Cloud LLM (provider key)</text>
+<rect x="690" y="216" width="350" height="42" rx="12" ry="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="216" width="6" height="42" rx="3" fill="#7c3aed"/>
+<text x="865.0" y="242" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Ollama · Qwen2.5 / Llama-3.1</text>
+<path d="M 641 237.0 L 684 237.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="224.0" width="52" height="26" rx="13" fill="#d97706"/>
+<text x="1080.0" y="241.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">swap</text>
+<text x="150" y="299.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Web search</text>
+<rect x="285" y="274" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="274" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="300" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Tavily / Brave (paid keys)</text>
+<rect x="690" y="274" width="350" height="42" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="274" width="6" height="42" rx="3" fill="#0d9488"/>
+<text x="865.0" y="300" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">SearxNG (self-host) · DuckDuckGo</text>
+<path d="M 641 295.0 L 684 295.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="282.0" width="52" height="26" rx="13" fill="#d97706"/>
+<text x="1080.0" y="299.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">swap</text>
+<text x="150" y="357.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Web extraction</text>
+<rect x="285" y="332" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="332" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="358" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Jina / hosted reader</text>
+<rect x="690" y="332" width="350" height="42" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="332" width="6" height="42" rx="3" fill="#0d9488"/>
+<text x="865.0" y="358" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">trafilatura · Playwright</text>
+<path d="M 641 353.0 L 684 353.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="340.0" width="52" height="26" rx="13" fill="#d97706"/>
+<text x="1080.0" y="357.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">swap</text>
+<text x="150" y="415.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Code sandbox</text>
+<rect x="285" y="390" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="390" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="416" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Managed K8s provisioner</text>
+<rect x="690" y="390" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="390" width="6" height="42" rx="3" fill="#334155"/>
+<text x="865.0" y="416" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Docker + nsjail exec</text>
+<path d="M 641 411.0 L 684 411.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="398.0" width="52" height="26" rx="13" fill="#d97706"/>
+<text x="1080.0" y="415.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">swap</text>
+<text x="150" y="473.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">State / resume</text>
+<rect x="285" y="448" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="448" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="474" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Postgres checkpointer</text>
+<rect x="690" y="448" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="448" width="6" height="42" rx="3" fill="#334155"/>
+<text x="865.0" y="474" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">SQLite / Postgres checkpointer</text>
+<path d="M 641 469.0 L 684 469.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="456.0" width="52" height="26" rx="13" fill="#059669"/>
+<text x="1080.0" y="473.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">keep</text>
+<text x="150" y="531.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">External tools</text>
+<rect x="285" y="506" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="506" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="532" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">MCP servers</text>
+<rect x="690" y="506" width="350" height="42" rx="12" ry="12" fill="#ecfdf5" stroke="#059669" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="506" width="6" height="42" rx="3" fill="#059669"/>
+<text x="865.0" y="532" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">MCP servers (open protocol)</text>
+<path d="M 641 527.0 L 684 527.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="514.0" width="52" height="26" rx="13" fill="#059669"/>
+<text x="1080.0" y="531.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">keep</text>
+<text x="150" y="589.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Gateway / stream</text>
+<rect x="285" y="564" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="564" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="590" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Message gateway (REST+SSE)</text>
+<rect x="690" y="564" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="564" width="6" height="42" rx="3" fill="#334155"/>
+<text x="865.0" y="590" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">FastAPI + SSE</text>
+<path d="M 641 585.0 L 684 585.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="572.0" width="52" height="26" rx="13" fill="#d97706"/>
+<text x="1080.0" y="589.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">swap</text>
+<text x="150" y="647.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Skills / memory</text>
+<rect x="285" y="622" width="350" height="42" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="285" y="622" width="6" height="42" rx="3" fill="#334155"/>
+<text x="460.0" y="648" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Built-in skill + memory</text>
+<rect x="690" y="622" width="350" height="42" rx="12" ry="12" fill="#fffbeb" stroke="#d97706" stroke-width="2" filter="url(#sh)"/>
+<rect x="690" y="622" width="6" height="42" rx="3" fill="#d97706"/>
+<text x="865.0" y="648" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Markdown skills + vector memory</text>
+<path d="M 641 643.0 L 684 643.0" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="1054" y="630.0" width="52" height="26" rx="13" fill="#d97706"/>
+<text x="1080.0" y="647.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="800" fill="#ffffff" text-anchor="middle" style="">swap</text>
+<text x="610.0" y="34" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="800" fill="#0f172a" text-anchor="middle" style="">DeerFlow → Open-DeerFlow — component mapping</text>
+<text x="610.0" y="58" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="normal" fill="#475569" text-anchor="middle" style="">Most of the stack is already open; only hosted search + cloud LLM truly need swapping</text></svg><figcaption>DeerFlow → Open-DeerFlow mapping</figcaption></figure></p>
+<p>The rewiring, concretely:</p>
+<ul>
+<li><strong>Cloud LLM → Ollama.</strong> Point both model tiers at a local <a href="https://ollama.com">Ollama</a> server (<code>qwen2.5:14b</code> for reasoning, <code>llama3.1:8b</code> for routing). One env var.</li>
+<li><strong>Tavily/Brave → SearxNG.</strong> Run a self-hosted <a href="https://github.com/searxng/searxng">SearxNG</a> meta-search (Docker one-liner) and expose it as an MCP tool. If it's down, fall back to keyless DuckDuckGo — so the tool works with <em>zero</em> setup.</li>
+<li><strong>Hosted reader → trafilatura.</strong> The best open-source boilerplate remover turns any URL into clean text locally.</li>
+<li><strong>Managed K8s sandbox → Docker.</strong> <code>docker run --network none --memory 512m</code> gives you the same isolation guarantees on one machine.</li>
+</ul>
+<p>Everything else — the graph, the checkpointer, the MCP protocol, the message gateway (now FastAPI + SSE) — stays. That is the whole thesis: <strong>the value of DeerFlow is the <em>pattern</em>, and the pattern is portable.</strong></p>
+<h3>The open-source architecture</h3>
+<p>Same shape, different substrate. Compare this to the diagram in §2 — the boxes in the middle are <em>identical</em>; only the right-hand tools and bottom-row runtime changed colour:</p>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 910" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"><rect width="1180" height="910" fill="#ffffff"/><defs><marker id="ar--475569" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker><marker id="ar--94a3b8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker><marker id="ar--0d9488" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0d9488"/></marker><marker id="ar--7c3aed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/></marker><filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter></defs><rect x="40" y="96" width="250" height="250" rx="16" ry="16" fill="none" stroke="#475569" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="56" y="83" width="62.4" height="24" rx="12" fill="#475569"/>
+<text x="87.2" y="99" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">Clients</text>
+<rect x="55" y="120" width="220" height="56" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="120" width="6" height="56" rx="3" fill="#334155"/>
+<text x="165.0" y="146" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Web UI (Next.js)</text>
+<text x="165.0" y="166" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">chat · plan review · replay</text>
+<rect x="55" y="188" width="220" height="50" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="188" width="6" height="50" rx="3" fill="#334155"/>
+<text x="165.0" y="214" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Python SDK</text>
+<text x="165.0" y="234" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">client.run(task)</text>
+<rect x="55" y="252" width="220" height="74" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="252" width="6" height="74" rx="3" fill="#334155"/>
+<text x="165.0" y="278" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Message Gateway</text>
+<text x="165.0" y="298" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">FastAPI + SSE, auth</text>
+<rect x="315" y="96" width="470" height="560" rx="16" ry="16" fill="none" stroke="#4f46e5" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="331" y="83" width="264.0" height="24" rx="12" fill="#4f46e5"/>
+<text x="463.0" y="99" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">LangGraph Orchestrator (StateGraph)</text>
+<rect x="345" y="122" width="410" height="50" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="122" width="6" height="50" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="148" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coordinator</text>
+<text x="550.0" y="168" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">intent routing · entry</text>
+<rect x="345" y="186" width="410" height="50" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="186" width="6" height="50" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="212" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Planner</text>
+<text x="550.0" y="232" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">decompose into a research plan</text>
+<rect x="345" y="250" width="410" height="46" rx="12" ry="12" fill="#ecfdf5" stroke="#059669" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="250" width="6" height="46" rx="3" fill="#059669"/>
+<text x="550.0" y="276" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Human Feedback</text>
+<text x="550.0" y="296" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">accept / edit plan (interrupt)</text>
+<rect x="345" y="316" width="410" height="44" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="316" width="6" height="44" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="342" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Research Team</text>
+<text x="550.0" y="362" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">supervisor · loops over steps</text>
+<rect x="345" y="378" width="195" height="64" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="378" width="6" height="64" rx="3" fill="#4f46e5"/>
+<text x="442.5" y="404" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Researcher</text>
+<text x="442.5" y="424" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">gather + cite evidence</text>
+<rect x="560" y="378" width="195" height="64" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="560" y="378" width="6" height="64" rx="3" fill="#4f46e5"/>
+<text x="657.5" y="404" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coder</text>
+<text x="657.5" y="424" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">analyse · run Python</text>
+<rect x="345" y="470" width="410" height="52" rx="12" ry="12" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="345" y="470" width="6" height="52" rx="3" fill="#4f46e5"/>
+<text x="550.0" y="496" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reporter</text>
+<text x="550.0" y="516" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">synthesise final cited report</text>
+<rect x="800" y="96" width="340" height="448" rx="16" ry="16" fill="none" stroke="#0d9488" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="816" y="83" width="235.20000000000002" height="24" rx="12" fill="#0d9488"/>
+<text x="933.6" y="99" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">Tools &amp; Skills (built-in + MCP)</text>
+<rect x="815" y="122" width="310" height="52" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="122" width="6" height="52" rx="3" fill="#0d9488"/>
+<text x="970.0" y="148" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Web Search (MCP)</text>
+<text x="970.0" y="168" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">SearxNG (self-hosted) · DuckDuckGo</text>
+<rect x="815" y="184" width="310" height="48" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="184" width="6" height="48" rx="3" fill="#0d9488"/>
+<text x="970.0" y="210" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Crawler (MCP)</text>
+<text x="970.0" y="230" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">trafilatura · Playwright</text>
+<rect x="815" y="242" width="310" height="52" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="242" width="6" height="52" rx="3" fill="#0d9488"/>
+<text x="970.0" y="268" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Python REPL</text>
+<text x="970.0" y="288" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">executes inside the sandbox</text>
+<rect x="815" y="304" width="310" height="48" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="304" width="6" height="48" rx="3" fill="#0d9488"/>
+<text x="970.0" y="330" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">RAG Retriever</text>
+<text x="970.0" y="350" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">private docs · vector store</text>
+<rect x="815" y="362" width="310" height="50" rx="12" ry="12" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="362" width="6" height="50" rx="3" fill="#0d9488"/>
+<text x="970.0" y="388" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">MCP Servers</text>
+<text x="970.0" y="408" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">pluggable external tools</text>
+<rect x="815" y="422" width="310" height="60" rx="12" ry="12" fill="#fffbeb" stroke="#d97706" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="422" width="6" height="60" rx="3" fill="#d97706"/>
+<text x="970.0" y="448" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Skills</text>
+<text x="970.0" y="468" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">reusable prompt+tool playbooks</text>
+<rect x="40" y="690" width="730" height="150" rx="16" ry="16" fill="none" stroke="#475569" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="56" y="677" width="120.0" height="24" rx="12" fill="#475569"/>
+<text x="116.0" y="693" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">Runtime &amp; State</text>
+<rect x="55" y="720" width="225" height="62" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="55" y="720" width="6" height="62" rx="3" fill="#334155"/>
+<text x="167.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Docker Sandbox</text>
+<text x="167.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">restricted exec · nsjail</text>
+<rect x="295" y="720" width="215" height="62" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="295" y="720" width="6" height="62" rx="3" fill="#334155"/>
+<text x="402.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Checkpointer</text>
+<text x="402.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">SQLite / Postgres (langgraph)</text>
+<rect x="525" y="720" width="230" height="62" rx="12" ry="12" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="525" y="720" width="6" height="62" rx="3" fill="#334155"/>
+<text x="640.0" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Filesystem + Memory</text>
+<text x="640.0" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">artifacts · long-term memory</text>
+<rect x="800" y="690" width="340" height="150" rx="16" ry="16" fill="none" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="7 5"/>
+<rect x="816" y="677" width="105.60000000000001" height="24" rx="12" fill="#7c3aed"/>
+<text x="868.8" y="693" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" style="">LLM Providers</text>
+<rect x="815" y="720" width="155" height="62" rx="12" ry="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#sh)"/>
+<rect x="815" y="720" width="6" height="62" rx="3" fill="#7c3aed"/>
+<text x="892.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reasoning LLM</text>
+<text x="892.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Ollama · Qwen2.5 /</text>
+<text x="892.5" y="782" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Llama-3.1</text>
+<rect x="980" y="720" width="145" height="62" rx="12" ry="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#sh)"/>
+<rect x="980" y="720" width="6" height="62" rx="3" fill="#7c3aed"/>
+<text x="1052.5" y="746" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Basic · Vision</text>
+<text x="1052.5" y="766" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Ollama ·</text>
+<text x="1052.5" y="782" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="middle" style="">Llama-3.2-Vision</text>
+<path d="M 280 285 Q 311.5 205.5 343 150" fill="none" stroke="#475569" stroke-width="2.2"  marker-end="url(#ar--475569)"/>
+<rect x="293.7" y="198.5" width="35.6" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="311.5" y="211.5" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">task</text>
+<path d="M 550 172 L 550 186" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 550 236 L 550 250" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 550 296 L 550 316" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 470 360 L 442 378" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 630 360 L 658 378" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 550 442 L 550 470" fill="none" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<path d="M 757 338 Q 785.0 305.0 813 300" fill="none" stroke="#0d9488" stroke-width="2.2"  marker-end="url(#ar--0d9488)"/>
+<rect x="693.6" y="300.0" width="182.8" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="785.0" y="313.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">search · crawl · exec · RAG</text>
+<path d="M 343 496 Q 310.5 424.0 278 300" fill="none" stroke="#475569" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ar--475569)"/>
+<rect x="263.9" y="379.0" width="93.2" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="310.5" y="392.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">stream result</text>
+<path d="M 430 656 Q 380.0 683.0 330 690" fill="none" stroke="#475569" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ar--475569)"/>
+<rect x="323.8" y="654.0" width="112.4" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="380.0" y="667.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">checkpoint state</text>
+<path d="M 670 656 Q 785.0 691.0 900 690" fill="none" stroke="#7c3aed" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#ar--7c3aed)"/>
+<rect x="728.8" y="654.0" width="112.4" height="18" rx="6" fill="#ffffff" opacity="0.92"/>
+<text x="785.0" y="667.0" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11" font-weight="600" fill="#475569" text-anchor="middle" style="">every node → LLM</text>
+<g>
+<rect x="60" y="881" width="16" height="16" rx="4" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+<text x="84" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Agent</text>
+<rect x="232" y="881" width="16" height="16" rx="4" fill="#ecfeff" stroke="#0d9488" stroke-width="2"/>
+<text x="256" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Tool</text>
+<rect x="404" y="881" width="16" height="16" rx="4" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+<text x="428" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Skill</text>
+<rect x="576" y="881" width="16" height="16" rx="4" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+<text x="600" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Model</text>
+<rect x="748" y="881" width="16" height="16" rx="4" fill="#f1f5f9" stroke="#334155" stroke-width="2"/>
+<text x="772" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Infra</text>
+<rect x="920" y="881" width="16" height="16" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+<text x="944" y="894" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600" fill="#475569" text-anchor="start" style="">Human gate</text>
+</g>
+<text x="590.0" y="34" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="800" fill="#0f172a" text-anchor="middle" style="">Open-DeerFlow — Architecture (open-source rewrite)</text>
+<text x="590.0" y="58" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="normal" fill="#475569" text-anchor="middle" style="">Same LangGraph topology, every closed dependency swapped for a local/OSS one</text></svg><figcaption>Open-DeerFlow architecture</figcaption></figure></p>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 920" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"><rect width="1280" height="920" fill="#ffffff"/><defs><marker id="ar--475569" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker><marker id="ar--94a3b8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker><marker id="ar--0d9488" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0d9488"/></marker><marker id="ar--7c3aed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/></marker><filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/></filter></defs><rect x="29.0" y="70" width="122" height="42" rx="11" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="29.0" y="70" width="6" height="42" rx="3" fill="#334155"/>
+<text x="90.0" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">User</text>
+<line x1="90.0" y1="114" x2="90.0" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="186.14285714285714" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="186.14285714285714" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="247.14285714285714" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coordinator</text>
+<line x1="247.14285714285714" y1="114" x2="247.14285714285714" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="343.2857142857143" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="343.2857142857143" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="404.2857142857143" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Planner</text>
+<line x1="404.2857142857143" y1="114" x2="404.2857142857143" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="500.42857142857144" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="500.42857142857144" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="561.4285714285714" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Researcher</text>
+<line x1="561.4285714285714" y1="114" x2="561.4285714285714" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="653.5714285714286" y="70" width="130" height="42" rx="11" fill="#ecfeff" stroke="#0d9488" stroke-width="2" filter="url(#sh)"/>
+<rect x="653.5714285714286" y="70" width="6" height="42" rx="3" fill="#0d9488"/>
+<text x="718.5714285714286" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">SearxNG (MCP)</text>
+<line x1="718.5714285714286" y1="114" x2="718.5714285714286" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="814.7142857142857" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="814.7142857142857" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="875.7142857142857" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Coder</text>
+<line x1="875.7142857142857" y1="114" x2="875.7142857142857" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="963.8571428571429" y="70" width="138" height="42" rx="11" fill="#f1f5f9" stroke="#334155" stroke-width="2" filter="url(#sh)"/>
+<rect x="963.8571428571429" y="70" width="6" height="42" rx="3" fill="#334155"/>
+<text x="1032.857142857143" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Docker Sandbox</text>
+<line x1="1032.857142857143" y1="114" x2="1032.857142857143" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<rect x="1129.0" y="70" width="122" height="42" rx="11" fill="#eef2ff" stroke="#4f46e5" stroke-width="2" filter="url(#sh)"/>
+<rect x="1129.0" y="70" width="6" height="42" rx="3" fill="#4f46e5"/>
+<text x="1190.0" y="97" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#0f172a" text-anchor="middle" style="">Reporter</text>
+<line x1="1190.0" y1="114" x2="1190.0" y2="894" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="4 6"/>
+<line x1="90.0" y1="142" x2="247.14285714285714" y2="142" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="112.97142857142856" y="123" width="111.2" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="168.57142857142856" y="136" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">research request</text>
+<line x1="247.14285714285714" y1="192" x2="404.2857142857143" y2="192" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="217.4142857142857" y="173" width="216.6" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="325.7142857142857" y="186" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">classified as research → hand off</text>
+<line x1="404.2857142857143" y1="242" x2="90.0" y2="242" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="179.14285714285714" y="223" width="136.0" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="247.14285714285714" y="236" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">propose plan (steps)</text>
+<line x1="90.0" y1="292" x2="404.2857142857143" y2="292" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="185.34285714285713" y="273" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="247.14285714285714" y="286" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">accept / edit plan</text>
+<line x1="60" y1="328" x2="1220" y2="328" stroke="#cbd5e1" stroke-width="1.2" stroke-dasharray="2 6"/>
+<rect x="542.9" y="318" width="194.2" height="20" rx="10" fill="#e2e8f0"/>
+<text x="640.0" y="332" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="700" fill="#475569" text-anchor="middle" style="">loop  ·  for each plan step</text>
+<line x1="404.2857142857143" y1="392" x2="561.4285714285714" y2="392" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="411.75714285714287" y="373" width="142.20000000000002" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="482.8571428571429" y="386" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">execute research step</text>
+<line x1="561.4285714285714" y1="442" x2="718.5714285714286" y2="442" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="578.2" y="423" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="640.0" y="436" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">web_search / crawl</text>
+<line x1="718.5714285714286" y1="492" x2="561.4285714285714" y2="492" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="578.2" y="473" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="640.0" y="486" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">sources + snippets</text>
+<line x1="561.4285714285714" y1="542" x2="875.7142857142857" y2="542" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="616.4714285714285" y="523" width="204.20000000000002" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="718.5714285714286" y="536" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">hand structured data to analyst</text>
+<line x1="875.7142857142857" y1="592" x2="1032.857142857143" y2="592" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="870.7857142857142" y="573" width="167.0" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="954.2857142857142" y="586" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">run python (charts, calc)</text>
+<line x1="1032.857142857143" y1="642" x2="875.7142857142857" y2="642" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="892.4857142857143" y="623" width="123.60000000000001" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="954.2857142857142" y="636" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">stdout / artifacts</text>
+<rect x="233.14285714285714" y="672" width="970.8571428571429" height="30" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+<text x="718.5714285714286" y="691" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">every node calls the Ollama; state saved to checkpointer after each step</text>
+<line x1="60" y1="728" x2="1220" y2="728" stroke="#cbd5e1" stroke-width="1.2" stroke-dasharray="2 6"/>
+<rect x="605.6" y="718" width="68.8" height="20" rx="10" fill="#e2e8f0"/>
+<text x="640.0" y="732" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="700" fill="#475569" text-anchor="middle" style="">end loop</text>
+<line x1="875.7142857142857" y1="792" x2="1190.0" y2="792" stroke="#94a3b8" stroke-width="2.2"  marker-end="url(#ar--94a3b8)"/>
+<rect x="967.9571428571429" y="773" width="129.8" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="1032.857142857143" y="786" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">findings + evidence</text>
+<line x1="1190.0" y1="842" x2="90.0" y2="842" stroke="#94a3b8" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#ar--94a3b8)"/>
+<rect x="544.1" y="823" width="191.8" height="17" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="640.0" y="836" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="11.5" font-weight="600" fill="#0f172a" text-anchor="middle" style="">final cited report (streamed)</text>
+<text x="640.0" y="34" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="800" fill="#0f172a" text-anchor="middle" style="">Open-DeerFlow — Sequence of one research task</text>
+<text x="640.0" y="58" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="normal" fill="#475569" text-anchor="middle" style="">Identical control flow — SearxNG for search, Ollama for the model, Docker for exec</text></svg><figcaption>Open-DeerFlow sequence</figcaption></figure></p>
+<p>The sequence diagram is deliberately unchanged in structure: swapping SearxNG for Tavily and Ollama for a cloud model does <strong>not</strong> alter the control flow. That's the payoff of keeping capabilities behind a clean interface.</p>
+<hr />
+<h2>4. The code, line by line</h2>
+<p>The full package is in <a href="src/open_deerflow"><code>src/open_deerflow</code></a>. Below are the pieces that carry the ideas. (Layout: <code>agents/</code> are graph nodes, <code>tools/</code> are standalone MCP servers, <code>skills/</code> are Markdown playbooks.)</p>
+<h3>4.1 The shared state — the "single source of truth"</h3>
+<p>LangGraph passes one object between nodes. Reducers like <code>add_messages</code> make a field <em>append</em> instead of <em>overwrite</em>.</p>
+<pre><code class="language-python"># src/open_deerflow/state.py
+class Step(TypedDict):
+    id: int
+    description: str
+    agent: str          # &quot;researcher&quot; | &quot;coder&quot;
+    done: bool
+    result: str
+
+class DeerState(TypedDict):
+    task: str                                 # the user's original request
+    messages: Annotated[list, add_messages]   # running chat log (append-only)
+    plan: list[Step]                          # the (possibly human-edited) plan
+    plan_approved: bool                       # gate set by human_feedback
+    cursor: int                               # index of the step being executed
+    observations: list[str]                   # evidence accumulated by the team
+    final_report: str                         # filled in by the reporter
+</code></pre>
+<h3>4.2 The model swap lives in one function</h3>
+<p>Nothing else in the codebase knows the model isn't in the cloud. Change the provider here and the whole system follows.</p>
+<pre><code class="language-python"># src/open_deerflow/config.py
+def get_llm(tier: str = &quot;reasoning&quot;):
+    if CONFIG.llm.provider == &quot;ollama&quot;:
+        from langchain_ollama import ChatOllama
+        model = (CONFIG.llm.reasoning_model if tier == &quot;reasoning&quot;
+                 else CONFIG.llm.basic_model)
+        return ChatOllama(model=model, base_url=CONFIG.llm.base_url,
+                          temperature=CONFIG.llm.temperature)
+    raise ValueError(f&quot;Unsupported provider: {CONFIG.llm.provider}&quot;)
+</code></pre>
+<h3>4.3 A tool — <code>web_search</code> as an MCP server</h3>
+<p>This is the search capability. It tries self-hosted SearxNG, then falls back to keyless DuckDuckGo. Crucially it is a <strong>standalone MCP server</strong>: the same file works from this graph, from Claude Desktop, or from Cursor.</p>
+<pre><code class="language-python"># src/open_deerflow/tools/search_server.py
+mcp = FastMCP(&quot;open-deerflow-search&quot;)
+SEARXNG_URL = os.getenv(&quot;SEARXNG_URL&quot;, &quot;http://localhost:8080&quot;)
+
+@mcp.tool()
+def web_search(query: str, max_results: int = 6) -&gt; list[dict]:
+    &quot;&quot;&quot;Search the web. Returns a list of {title, url, snippet}.&quot;&quot;&quot;
+    try:                                            # 1) private, unlimited, free
+        resp = httpx.get(f&quot;{SEARXNG_URL}/search&quot;,
+                         params={&quot;q&quot;: query, &quot;format&quot;: &quot;json&quot;}, timeout=15)
+        resp.raise_for_status()
+        hits = resp.json().get(&quot;results&quot;, [])[:max_results]
+        if hits:
+            return [{&quot;title&quot;: h.get(&quot;title&quot;), &quot;url&quot;: h.get(&quot;url&quot;),
+                     &quot;snippet&quot;: h.get(&quot;content&quot;, &quot;&quot;)} for h in hits]
+    except Exception:
+        pass                                        # SearxNG down -&gt; fall through
+    from ddgs import DDGS                            # 2) keyless fallback
+    with DDGS() as ddg:
+        return [{&quot;title&quot;: h[&quot;title&quot;], &quot;url&quot;: h[&quot;href&quot;], &quot;snippet&quot;: h[&quot;body&quot;]}
+                for h in ddg.text(query, max_results=max_results)]
+
+if __name__ == &quot;__main__&quot;:
+    mcp.run()                                       # stdio transport
+</code></pre>
+<h3>4.4 An agent — the Researcher</h3>
+<p>An "agent" here is nothing more than <em>an LLM + a prompt + a set of tools</em>. The tools are injected at build time, so this node has no idea SearxNG or MCP exist — it just calls <code>web_search</code>.</p>
+<pre><code class="language-python"># src/open_deerflow/agents/researcher.py
+def make_researcher(tools):
+    agent = create_react_agent(get_llm(&quot;reasoning&quot;), tools=tools,
+                               prompt=RESEARCHER_PROMPT)
+
+    def researcher(state) -&gt; Command:
+        step = state[&quot;plan&quot;][state[&quot;cursor&quot;]]
+        result = agent.invoke({&quot;messages&quot;: [(&quot;user&quot;, step[&quot;description&quot;])]})
+        answer = result[&quot;messages&quot;][-1].content
+        plan = state[&quot;plan&quot;]
+        plan[state[&quot;cursor&quot;]][&quot;done&quot;] = True
+        plan[state[&quot;cursor&quot;]][&quot;result&quot;] = answer
+        return Command(goto=&quot;research_team&quot;,             # return to the supervisor
+                       update={&quot;plan&quot;: plan,
+                               &quot;observations&quot;: state[&quot;observations&quot;] + [answer]})
+    return researcher
+</code></pre>
+<p>The <strong>supervisor</strong> that dispatches to it is deliberately tiny — it owns no model, it just routes:</p>
+<pre><code class="language-python"># src/open_deerflow/agents/research_team.py
+def research_team(state) -&gt; Command:
+    for step in state[&quot;plan&quot;]:
+        if not step[&quot;done&quot;]:
+            goto = &quot;coder&quot; if step[&quot;agent&quot;] == &quot;coder&quot; else &quot;researcher&quot;
+            return Command(goto=goto, update={&quot;cursor&quot;: step[&quot;id&quot;]})
+    return Command(goto=&quot;reporter&quot;)     # all steps done -&gt; synthesise
+</code></pre>
+<h3>4.5 A skill — the Reporter's playbook</h3>
+<p>The Reporter calls <strong>no tools</strong>. Its behaviour is governed by a <em>skill</em>: a Markdown file loaded at runtime.</p>
+<pre><code class="language-python"># src/open_deerflow/agents/reporter.py
+def reporter(state) -&gt; Command:
+    llm = get_llm(&quot;reasoning&quot;)
+    evidence = &quot;\n\n---\n\n&quot;.join(state[&quot;observations&quot;]) or &quot;(no evidence)&quot;
+    prompt = REPORTER_PROMPT.format(
+        skill=load_skill(&quot;report_writing&quot;),   # &lt;- editable Markdown playbook
+        task=state[&quot;task&quot;], evidence=evidence)
+    return Command(goto=END, update={&quot;final_report&quot;: llm.invoke(prompt).content})
+</code></pre>
+<h3>4.6 Assembling the graph</h3>
+<p>Only <strong>one</strong> edge is static (<code>START → coordinator</code>). Every other transition is decided by the <code>Command(goto=...)</code> a node returns, which is why this file is so short:</p>
+<pre><code class="language-python"># src/open_deerflow/graph.py
+def build_graph(checkpointer=None):
+    tools = _load_mcp_tools()                        # launches the 3 MCP servers
+    research_tools = [t for t in tools if t.name in (&quot;web_search&quot;, &quot;read_url&quot;)]
+    code_tools     = [t for t in tools if t.name == &quot;python_exec&quot;]
+
+    g = StateGraph(DeerState)
+    g.add_node(&quot;coordinator&quot;, coordinator)
+    g.add_node(&quot;planner&quot;, planner)
+    g.add_node(&quot;human_feedback&quot;, human_feedback)
+    g.add_node(&quot;research_team&quot;, research_team)
+    g.add_node(&quot;researcher&quot;, make_researcher(research_tools))
+    g.add_node(&quot;coder&quot;, make_coder(code_tools))
+    g.add_node(&quot;reporter&quot;, reporter)
+    g.add_edge(START, &quot;coordinator&quot;)                 # the only static edge
+    return g.compile(checkpointer=checkpointer)
+</code></pre>
+<h3>Why is something a <em>tool</em> and not a <em>skill</em>?</h3>
+<p>This is the single most useful distinction when you design an agent system, and the two files above are the clean contrast:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Tool</strong> (<code>web_search</code>, <code>python_exec</code>)</th>
+<th><strong>Skill</strong> (<code>report_writing.md</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Has an API boundary?</td>
+<td><strong>Yes</strong> — typed inputs → typed outputs</td>
+<td>No — it's prose</td>
+</tr>
+<tr>
+<td>Side effects?</td>
+<td><strong>Yes</strong> — network, filesystem, code execution</td>
+<td>None</td>
+</tr>
+<tr>
+<td>How the model uses it</td>
+<td>The model <strong>calls</strong> it and reads the return value</td>
+<td>The model <strong>reads</strong> it to shape its reasoning</td>
+</tr>
+<tr>
+<td>Who edits it</td>
+<td>An engineer (it's code)</td>
+<td>A domain expert (it's Markdown)</td>
+</tr>
+<tr>
+<td>Where it should live</td>
+<td>Behind <strong>MCP</strong>, so any client can reuse it</td>
+<td>In a file the model loads at runtime</td>
+</tr>
+</tbody>
+</table>
+<p>Rule of thumb: <strong>if it touches the outside world or must return a verifiable value, it's a tool — put it behind MCP. If it's knowledge about <em>how to think</em>, it's a skill — keep it as editable text.</strong> Search is a tool because "did we actually hit the internet and get results?" is verifiable. "How to structure a report" is a skill because it has no correct return value — only better or worse prose.</p>
+<hr />
+<h2>Run it yourself</h2>
+<pre><code class="language-bash">pip install -e .                      # install the package
+docker compose up -d                  # optional: self-hosted SearxNG search
+ollama pull qwen2.5:14b-instruct      # the reasoning model
+python -m open_deerflow.main &quot;Compare the top 3 open-source vector databases in 2026&quot;
+</code></pre>
+<p>The run prints the plan, waits for your approval (pass <code>--interactive</code>), then streams the research/analysis loop and the final cited report. Everything runs on your machine.</p>
+<hr />
+<p><em>Architecture and control flow described here reflect DeerFlow's documented, real design (LangGraph coordinator → planner → research team → reporter). Momentum figures and version specifics originate from the auto-generated Gittyboy brief and are not independently verified. Code in this repo is a compact educational reimplementation, not ByteDance's source.</em></p>
+</div></body></html>
